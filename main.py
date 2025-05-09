@@ -1,16 +1,22 @@
-from urllib.parse import parse_qs, unquote, urlparse
-from fastapi import FastAPI, HTTPException
-from typing import List, Dict, Any, Optional
+from fastapi import FastAPI, HTTPException, Body, Query
+from typing import List, Dict, Any
 import httpx
 from bs4 import BeautifulSoup
+from abc import ABC, abstractmethod
 import json
 import re
 from datetime import datetime
+import os
+import urllib.parse
 
 app = FastAPI()
 
+# Create data directory if it doesn't exist
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
 
-# Helper functions
+
+# Helper functions for DBC News
 def convert_bengali_to_english_digits(s: str) -> str:
     bengali_digits = "০১২৩৪৫৬৭৮৯"
     return "".join(
@@ -18,7 +24,7 @@ def convert_bengali_to_english_digits(s: str) -> str:
     )
 
 
-def parse_bengali_date(raw: str) -> Optional[str]:
+def parse_bengali_date(raw: str) -> str:
     if not raw:
         return None
 
@@ -26,30 +32,34 @@ def parse_bengali_date(raw: str) -> Optional[str]:
 
     # Handle relative time (e.g., "৩ ঘন্টা আগে", "৫ মিনিট আগে", "১ দিন আগে")
     if "আগে" in raw:
-        parts = raw.split(" ")
-        num_raw = parts[0]
-        num = int(convert_bengali_to_english_digits(num_raw))
+        try:
+            parts = raw.split(" ")
+            num_raw = parts[0]
+            num = int(convert_bengali_to_english_digits(num_raw))
 
-        unit = None
-        if "মিনিট" in raw:
-            unit = "minute"
-        elif "ঘন্টা" in raw:
-            unit = "hour"
-        elif "দিন" in raw:
-            unit = "day"
+            unit = None
+            if "মিনিট" in raw:
+                unit = "minute"
+            elif "ঘন্টা" in raw:
+                unit = "hour"
+            elif "দিন" in raw:
+                unit = "day"
 
-        if not unit:
+            if not unit:
+                return None
+
+            now = datetime.now()
+            if unit == "minute":
+                now = now.replace(minute=now.minute - num)
+            elif unit == "hour":
+                now = now.replace(hour=now.hour - num)
+            elif unit == "day":
+                now = now.replace(day=now.day - num)
+
+            return now.isoformat()
+        except Exception as e:
+            print(f"Failed to parse relative date: {e}")
             return None
-
-        now = datetime.now()
-        if unit == "minute":
-            now = now.replace(minute=now.minute - num)
-        elif unit == "hour":
-            now = now.replace(hour=now.hour - num)
-        elif unit == "day":
-            now = now.replace(day=now.day - num)
-
-        return now.isoformat()
 
     # Handle absolute date (e.g., "৯ই মে ২০২৫ ০১:০৫:৫১ অপরাহ্ন")
     months = {
@@ -69,70 +79,73 @@ def parse_bengali_date(raw: str) -> Optional[str]:
 
     try:
         parts = raw.split(" ")
-        day_raw = re.sub(r"[^০-৯]", "", parts[1])
+        day_raw = re.sub(r"[^০-৯]", "", parts[1])  # remove "শে"
         day = convert_bengali_to_english_digits(day_raw).zfill(2)
         month = months.get(parts[2], "01")
         year = convert_bengali_to_english_digits(parts[3])
+
+        # Handle time
         time_raw = convert_bengali_to_english_digits(parts[4])
         hour, minute, *rest = map(int, time_raw.split(":"))
         second = int(rest[0]) if rest else 0
         ampm = parts[5]
+
+        # Adjust hour based on AM/PM
         if ampm == "পূর্বাহ্ন" and hour == 12:
             hour = 0
         elif ampm == "অপরাহ্ন" and hour < 12:
             hour += 12
-        iso = f"{year}-{month}-{day}T{hour:02}:{minute:02}:{second:02}"
-        return iso
+
+        return f"{year}-{month}-{day}T{hour:02d}:{minute:02d}:{second:02d}"
     except Exception as e:
-        print(f"Failed to parse date: {e}")
+        print(f"Failed to parse absolute date: {e}")
         return None
 
 
-# Base Scraper Class
-class NewsScraperBase:
-    def __init__(self, base_url: str):
-        self.base_url = base_url
-        self.client = httpx.AsyncClient(timeout=15)
+# -------------------------------
+# Base Class
+# -------------------------------
+class NewsScraperBase(ABC):
+    def __init__(self, url: str):
+        self.base_url = url
 
-    async def fetch_html(self, url: str) -> BeautifulSoup:
-        resp = await self.client.get(url)
-        return BeautifulSoup(resp.text, "html.parser")
+    @abstractmethod
+    async def get_article_links(self, client: httpx.AsyncClient) -> List[str]: ...
 
-    async def get_article_links(self, client: httpx.AsyncClient) -> List[str]:
-        raise NotImplementedError
-
+    @abstractmethod
     async def parse_article(
         self, client: httpx.AsyncClient, url: str
-    ) -> Dict[str, Any]:
-        raise NotImplementedError
+    ) -> Dict[str, Any]: ...
 
-    async def scrape(self, client: httpx.AsyncClient) -> List[Dict[str, Any]]:
+    async def scrape(
+        self, client: httpx.AsyncClient, limit: int = 5
+    ) -> List[Dict[str, Any]]:
         links = await self.get_article_links(client)
-        articles = []
-        for link in links[:5]:  # Limit to 5 articles
+        results = []
+        for url in links[:limit]:
             try:
-                article = await self.parse_article(client, link)
-                articles.append(article)
+                data = await self.parse_article(client, url)
+                results.append(data)
             except Exception as e:
-                print(f"Error scraping {link}: {e}")
-        return articles
+                print(f"Failed to parse {url}: {e}")
+        return results
 
 
-# Jamuna TV Scraper
+# -------------------------------
+# Jamuna.tv Scraper
+# -------------------------------
 class JamunaScraper(NewsScraperBase):
-    def __init__(self):
-        super().__init__("https://jamuna.tv/")
-
     async def get_article_links(self, client: httpx.AsyncClient) -> List[str]:
         response = await client.get(self.base_url)
         soup = BeautifulSoup(response.text, "html.parser")
-        links = set()
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if href.startswith("/") and not href.startswith("//"):
-                full_url = f"{self.base_url.rstrip('/')}{href}"
-                links.add(full_url)
-        return list(links)
+        selectors = [".headline-link", ".entry-title a"]
+        links = []
+        for sel in selectors:
+            for tag in soup.select(sel):
+                href = tag.get("href")
+                if href and href.startswith("http"):
+                    links.append(href)
+        return list(dict.fromkeys(links))  # Remove duplicates
 
     async def parse_article(
         self, client: httpx.AsyncClient, url: str
@@ -162,39 +175,28 @@ class JamunaScraper(NewsScraperBase):
         return {
             "url": url,
             "title": title.get_text(strip=True) if title else "",
-            "coverImg": image.get("src") if image else "",
-            "publishedAt": published_at,
+            "cover_image": image.get("src") if image else "",
+            "published_at": published_at,
             "content": content,
-            "source": "Jamuna TV",
         }
 
 
+# -------------------------------
 # DBC News Scraper
+# -------------------------------
 class DBCNewsScraper(NewsScraperBase):
-    def __init__(self):
-        super().__init__("https://dbcnews.tv/articles")
-
     async def get_article_links(self, client: httpx.AsyncClient) -> List[str]:
         response = await client.get(self.base_url)
         soup = BeautifulSoup(response.text, "html.parser")
-        links = set()
+        links = []
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if "/articles/" in href:
                 full_url = (
-                    href if href.startswith("http") else "https://dbcnews.tv" + href
+                    href if href.startswith("http") else f"https://dbcnews.tv{href}"
                 )
-                links.add(full_url)
-        return list(links)
-
-    def extract_image_url(self, img_tag) -> str:
-        if not img_tag or not img_tag.has_attr("src"):
-            return ""
-        src = img_tag["src"]
-        if "url=" in src:
-            qs = parse_qs(urlparse(src).query)
-            return unquote(qs.get("url", [""])[0])
-        return src
+                links.append(full_url)
+        return list(dict.fromkeys(links))
 
     async def parse_article(
         self, client: httpx.AsyncClient, url: str
@@ -205,18 +207,9 @@ class DBCNewsScraper(NewsScraperBase):
         title = soup.find("h1")
         subtitle = soup.find("h3")
         image = soup.find("img", src=re.compile("api.dbcnews.tv"))
-
-        # Updated date extraction
         raw_date_el = soup.select_one("span.text-sm.whitespace-nowrap")
-        raw_date = None
-        if raw_date_el:
-            # Try to get date from title attribute first
-            raw_date = raw_date_el.get("title")
-            # If no title, try to get from text content
-            if not raw_date:
-                raw_date = raw_date_el.get_text(strip=True)
-            print(f"Found date: {raw_date}")  # Debug print
 
+        # Get article content
         paragraphs = [
             p.get_text(strip=True)
             for p in soup.select("div.article-content-wrapper p")
@@ -227,70 +220,87 @@ class DBCNewsScraper(NewsScraperBase):
             filter(None, [subtitle.text.strip() if subtitle else ""] + paragraphs)
         )
 
-        # Parse the date
-        published_at = parse_bengali_date(raw_date) if raw_date else None
-        print(f"Parsed date: {published_at}")  # Debug print
+        # Parse date
+        published_at = None
+        if raw_date_el:
+            raw_date = raw_date_el.get_text(strip=True)
+            published_at = parse_bengali_date(raw_date)
+
+        # Get full image URL
+        image_url = None
+        if image and image.get("src"):
+            src = image["src"]
+            if src.startswith("/_next/image"):
+                # Extract the actual URL from the Next.js image URL
+                match = re.search(r"url=([^&]+)", src)
+                if match:
+                    image_url = urllib.parse.unquote(match.group(1))
+            else:
+                image_url = src
 
         return {
             "url": url,
             "title": title.text.strip() if title else "",
-            "coverImg": self.extract_image_url(image),
-            "publishedAt": published_at,
+            "cover_image": image_url or "",
+            "published_at": published_at,
             "content": content,
-            "source": "DBC News",
         }
 
 
-# Factory function
-def get_scraper(source: str) -> Optional[NewsScraperBase]:
-    scrapers = {
-        "jamuna": JamunaScraper,
-        "dbcnews": DBCNewsScraper,
-    }
-    scraper_class = scrapers.get(source.lower())
-    return scraper_class() if scraper_class else None
+# -------------------------------
+# Scraper Factory
+# -------------------------------
+SCRAPER_MAP = {"jamuna": JamunaScraper, "dbcnews": DBCNewsScraper}
 
-
-# Configuration
 SCRAPER_CONFIG = {
     "jamuna": "https://jamuna.tv/",
     "dbcnews": "https://dbcnews.tv/articles",
 }
 
 
-# FastAPI Endpoints
+def get_scraper(source: str, url: str = None) -> NewsScraperBase:
+    if source not in SCRAPER_MAP:
+        raise ValueError(f"No scraper available for source '{source}'")
+    return SCRAPER_MAP[source](url or SCRAPER_CONFIG.get(source))
+
+
+def save_to_json(source: str, data: List[Dict[str, Any]]) -> None:
+    """Save scraped data to a JSON file."""
+    filename = os.path.join(DATA_DIR, f"{source}.json")
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# -------------------------------
+# API Endpoints
+# -------------------------------
+@app.get("/scrape-all")
+async def scrape_all() -> Dict[str, List[Dict[str, Any]]]:
+    async with httpx.AsyncClient(timeout=15) as client:
+        results = {}
+        for source in SCRAPER_MAP:
+            try:
+                scraper = get_scraper(source)
+                data = await scraper.scrape(client)
+                results[source] = data
+                # Save results for each source
+                save_to_json(source, data)
+            except Exception as e:
+                results[source] = {"error": str(e)}
+        return results
+
+
 @app.get("/scrape/{source}")
-async def scrape_single_source(source: str) -> List[Dict[str, Any]]:
+async def scrape_single_source(
+    source: str, url: str = Query(default=None)
+) -> List[Dict[str, Any]]:
     try:
-        scraper = get_scraper(source)
+        scraper = get_scraper(source, url)
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
 
     async with httpx.AsyncClient(timeout=15) as client:
         data = await scraper.scrape(client)
-
-        # Save to JSON file
-        filename = f"{source}_news.json"
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
+        # Save results for the source
+        save_to_json(source, data)
         return data
-
-
-@app.get("/scrape-all")
-async def scrape_all() -> Dict[str, List[Dict[str, Any]]]:
-    async with httpx.AsyncClient(timeout=15) as client:
-        results = {}
-        for source, url in SCRAPER_CONFIG.items():
-            try:
-                scraper = get_scraper(source)
-                data = await scraper.scrape(client)
-                results[source] = data
-
-                # Save to JSON file
-                filename = f"{source}_news.json"
-                with open(filename, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                results[source] = {"error": str(e)}
-        return results
