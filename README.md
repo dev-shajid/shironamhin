@@ -19,7 +19,7 @@ A FastAPI-based news scraping service that collects articles from various Bengal
 ## Prerequisites
 
 - Python 3.8 or higher
-- Package installer (pip or uv)
+- uv (Python package installer)
 - Git
 - Docker (optional, for containerized deployment)
 
@@ -44,13 +44,12 @@ python -m venv .venv
 .venv\Scripts\activate
 ```
 
-3. Install dependencies:
+3. Install uv and dependencies:
 ```bash
-# Using pip
-pip install -r requirements.txt
-
-# OR using uv (faster)
+# Install uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install dependencies using uv
 uv pip install -r requirements.txt
 ```
 
